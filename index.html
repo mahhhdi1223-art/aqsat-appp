@@ -34,6 +34,7 @@ svg{display:block;}
 
 .header{padding:calc(22px + env(safe-area-inset-top)) 18px 6px;}
 .header h1{margin:0;font-size:22px;font-weight:700;letter-spacing:-0.01em;}
+.header-row{display:flex;align-items:center;justify-content:space-between;}
 
 .stats-row{display:flex;gap:8px;padding:14px 18px 6px;}
 .stat-box{flex:1;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 8px;display:flex;flex-direction:column;align-items:center;gap:3px;}
@@ -340,6 +341,9 @@ const ICONS = {
   image: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>`,
   loader: `<svg class="spin" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>`,
   alert: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>`,
+  backup: `<svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`,
+  download: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`,
+  upload: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>`,
 };
 
 /* ---------------- App state ---------------- */
@@ -352,6 +356,7 @@ const state = {
   filter: "all",
   errorMsg: null,
   attachId: null, // id of sale currently in the attach modal
+  showBackup: false,
   addingPayment: false,
   confirmDeleteSale: false,
 };
@@ -401,12 +406,14 @@ function render() {
   else html = renderListScreen();
 
   const modal = state.attachId ? renderAttachModalShell() : "";
-  r.innerHTML = html + modal;
+  const backupModal = state.showBackup ? renderBackupModalShell() : "";
+  r.innerHTML = html + modal + backupModal;
   bindGlobalEvents();
   if (state.view === "add" || state.view === "edit") bindFormEvents();
   if (state.view === "detail") bindDetailEvents();
   if (state.view === "list") bindListEvents();
   if (state.attachId) loadAttachModalContent();
+  if (state.showBackup) bindBackupModal();
 }
 
 function getSelected() {
@@ -456,7 +463,10 @@ function renderListScreen() {
 
   return `
   <div class="screen">
-    <div class="header"><h1>دفتر الأقساط</h1></div>
+    <div class="header header-row">
+      <h1>دفتر الأقساط</h1>
+      <button class="icon-btn" id="backupBtn" title="نسخة احتياطية">${ICONS.backup}</button>
+    </div>
     <div class="stats-row">
       <div class="stat-box"><span class="stat-box-value">${state.sales.length}</span><span class="stat-box-label">إجمالي العملاء</span></div>
       <div class="stat-box highlight-due"><span class="stat-box-value">${unpaidThisMonth}</span><span class="stat-box-label">لم يسددوا هذا الشهر</span></div>
@@ -486,6 +496,8 @@ function bindListEvents() {
     btn.addEventListener("click", () => { state.filter = btn.dataset.filter; render(); });
   });
   document.getElementById("addBtn").addEventListener("click", () => { state.view = "add"; render(); });
+  const backupBtn = document.getElementById("backupBtn");
+  if (backupBtn) backupBtn.addEventListener("click", () => { state.showBackup = true; render(); });
   document.querySelectorAll("[data-open]").forEach((card) => {
     card.addEventListener("click", (e) => {
       if (e.target.closest("[data-attach]")) return;
@@ -852,11 +864,156 @@ function bindGlobalEvents() {
     document.getElementById("modalSheet").addEventListener("click", (e) => e.stopPropagation());
     document.getElementById("modalClose").addEventListener("click", closeAttachModal);
   }
+  const bBackdrop = document.getElementById("backupBackdrop");
+  if (bBackdrop) {
+    bBackdrop.addEventListener("click", (e) => { if (e.target === bBackdrop) closeBackupModal(); });
+    document.getElementById("backupSheet").addEventListener("click", (e) => e.stopPropagation());
+    document.getElementById("backupClose").addEventListener("click", closeBackupModal);
+  }
 }
 
 function closeAttachModal() {
   state.attachId = null;
   render();
+}
+
+function closeBackupModal() {
+  state.showBackup = false;
+  render();
+}
+
+/* ----- Backup export / import ----- */
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result); // data URL
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+function base64ToBlob(dataUrl) {
+  return fetch(dataUrl).then((r) => r.blob());
+}
+
+async function exportBackup(onProgress) {
+  const sales = await dbGetAllSales();
+  const exported = [];
+  for (let i = 0; i < sales.length; i++) {
+    const s = sales[i];
+    let receiptDataUrl = null;
+    if (s.hasReceipt) {
+      try {
+        const blob = await dbGetReceipt(s.id);
+        if (blob) receiptDataUrl = await blobToBase64(blob);
+      } catch (e) { /* skip this one receipt, keep the rest of the backup */ }
+    }
+    exported.push({ ...s, receiptDataUrl });
+    if (onProgress) onProgress(i + 1, sales.length);
+  }
+  const payload = {
+    app: "installment-ledger",
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    sales: exported,
+  };
+  const blob = new Blob([JSON.stringify(payload)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  const stamp = todayStr();
+  a.href = url;
+  a.download = `دفتر_الاقساط_نسخة_احتياطية_${stamp}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+
+async function importBackup(file, onProgress) {
+  const text = await file.text();
+  const payload = JSON.parse(text);
+  if (!payload || !Array.isArray(payload.sales)) throw new Error("invalid-file");
+  for (let i = 0; i < payload.sales.length; i++) {
+    const item = payload.sales[i];
+    const { receiptDataUrl, ...sale } = item;
+    if (receiptDataUrl) {
+      const blob = await base64ToBlob(receiptDataUrl);
+      await dbPutReceipt(sale.id, blob);
+      sale.hasReceipt = true;
+    }
+    await dbPutSale(sale);
+    if (onProgress) onProgress(i + 1, payload.sales.length);
+  }
+  await refreshSales();
+}
+
+function renderBackupModalShell() {
+  return `
+  <div class="modal-backdrop" id="backupBackdrop">
+    <div class="modal-sheet" id="backupSheet">
+      <div class="modal-head"><span>نسخة احتياطية</span><button class="icon-btn" id="backupClose">${ICONS.x}</button></div>
+      <div class="modal-body" id="backupBody"></div>
+    </div>
+  </div>`;
+}
+
+function bindBackupModal() {
+  const body = document.getElementById("backupBody");
+  renderIdle();
+
+  function renderIdle(msg) {
+    body.innerHTML = `
+      ${msg ? `<div class="hint">${esc(msg)}</div>` : ""}
+      <div class="hint muted-hint">
+        تصدير نسخة احتياطية يحمّل ملف واحد فيه كل بيانات عملائك وصور السندات.
+        احفظه في Google Drive أو ابعثه لإيميلك بشكل دوري، عشان ما تخسر بياناتك لو صار أي شي بجوالك.
+      </div>
+      <button class="btn-secondary full" id="doExport">${ICONS.download} تصدير نسخة احتياطية الآن</button>
+      <div style="height:6px"></div>
+      <button class="upload-btn" id="doImportPick">${ICONS.upload} استيراد نسخة احتياطية من ملف</button>
+      <span class="err" style="text-align:center;">تحذير: الاستيراد يدمج البيانات، ولو فيه عميل بنفس الرقم يستبدل بياناته القديمة.</span>
+      <input type="file" accept="application/json" id="importFile" style="display:none;" />`;
+
+    document.getElementById("doExport").addEventListener("click", async () => {
+      body.innerHTML = `<div class="modal-busy">${ICONS.loader}<span id="exportProgress">جارِ تجهيز النسخة الاحتياطية...</span></div>`;
+      try {
+        await exportBackup((done, total) => {
+          const p = document.getElementById("exportProgress");
+          if (p) p.textContent = `جارِ تجهيز النسخة الاحتياطية... (${done}/${total})`;
+        });
+        renderIdle("تم تحميل النسخة الاحتياطية بنجاح ✓");
+      } catch (e) {
+        renderIdle();
+        const errDiv = document.createElement("div");
+        errDiv.className = "modal-error";
+        errDiv.innerHTML = `${ICONS.alert}<span>تعذر تجهيز النسخة الاحتياطية، حاول مرة أخرى</span>`;
+        body.appendChild(errDiv);
+      }
+    });
+
+    const fileInput = document.getElementById("importFile");
+    document.getElementById("doImportPick").addEventListener("click", () => fileInput.click());
+    fileInput.addEventListener("change", async (e) => {
+      const file = e.target.files?.[0];
+      e.target.value = "";
+      if (!file) return;
+      body.innerHTML = `<div class="modal-busy">${ICONS.loader}<span id="importProgress">جارِ الاستيراد...</span></div>`;
+      try {
+        await importBackup(file, (done, total) => {
+          const p = document.getElementById("importProgress");
+          if (p) p.textContent = `جارِ الاستيراد... (${done}/${total})`;
+        });
+        renderIdle("تم استيراد النسخة الاحتياطية بنجاح ✓");
+        // refresh the list behind the modal
+        if (state.view === "list") renderListOnly();
+      } catch (e) {
+        renderIdle();
+        const errDiv = document.createElement("div");
+        errDiv.className = "modal-error";
+        errDiv.innerHTML = `${ICONS.alert}<span>الملف غير صالح أو تعذرت قراءته</span>`;
+        body.appendChild(errDiv);
+      }
+    });
+  }
 }
 
 async function loadAttachModalContent() {
