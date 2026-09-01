@@ -169,7 +169,7 @@ function getSupabaseClient(){
         persistSession:true,
         autoRefreshToken:true,
         detectSessionInUrl:true,
-        flowType:"pkce"
+        flowType:"implicit"
       }
     });
   }
@@ -270,7 +270,22 @@ function localUpdatedAt(sale){
 }
 
 async function syncAll(){
-  if(!cloud.user||cloud.busy||!navigator.onLine)return false;
+  if(cloud.busy||!navigator.onLine)return false;
+  /* Always refresh/read the current Supabase session before a cloud request.
+     This prevents an old access token from being used after the page has been
+     left open for a while, and makes a newly-opened browser recover cleanly. */
+  try{
+    const {data,error}=await supabaseClient.auth.getSession();
+    if(error)throw error;
+    cloud.session=data.session||null;
+    cloud.user=data.session?.user||null;
+  }catch(e){
+    cloud.error=fmtCloudError(e);
+    cloud.status="تعذر التحقق من الجلسة";
+    updateCloudIndicator();
+    return false;
+  }
+  if(!cloud.user)return false;
   cloud.busy=true;cloud.status="جارِ المزامنة…";cloud.error=null;cloud.lastErrorCode=null;updateCloudIndicator();
   try{
     /* Pull both live rows and deletion markers first. This makes a fresh browser
@@ -393,12 +408,29 @@ async function renderAuthBody(message=""){
     body.innerHTML=`<div class="hint">الحساب: <b>${esc(cloud.user.email||"حسابك")}</b><br>${esc(cloudLabel())}</div>
       ${cloud.error?`<div class="modal-error">${ICONS.alert}<span>${esc(cloud.error)}</span></div>`:""}
       <button class="btn-secondary full" id="syncNowBtn">☁️ مزامنة الآن</button>
+      <button class="btn-ghost" id="testCloudBtn" style="width:100%;margin-top:6px;">اختبار الاتصال بالسحابة</button>
       <button class="btn-ghost" id="signOutBtn" style="width:100%;margin-top:6px;">تسجيل الخروج</button>`;
     document.getElementById("syncNowBtn").onclick=async()=>{
       const btn=document.getElementById("syncNowBtn");
       if(btn){btn.disabled=true;btn.textContent="جارِ المزامنة…";}
       const ok=await syncAll();
       renderAuthBody(ok?"تمت المزامنة ✓":"تعذر إتمام المزامنة");
+    };
+    document.getElementById("testCloudBtn").onclick=async()=>{
+      const btn=document.getElementById("testCloudBtn");
+      if(btn){btn.disabled=true;btn.textContent="جارِ الاختبار…";}
+      try{
+        const {data,error}=await supabaseClient.auth.getSession();
+        if(error)throw error;
+        if(!data.session)throw new Error("no-session");
+        const {error:dbError}=await supabaseClient.from("installment_sales").select("id",{head:true,count:"exact"}).eq("user_id",data.session.user.id);
+        if(dbError)throw dbError;
+        cloud.error=null;cloud.status="الاتصال سليم";
+        renderAuthBody("الاتصال بالسحابة يعمل ✓");
+      }catch(e){
+        cloud.error=fmtCloudError(e);cloud.status="تعذر الاتصال";
+        renderAuthBody("فشل اختبار الاتصال");
+      }
     };
     document.getElementById("signOutBtn").onclick=async()=>{
       await supabaseClient.auth.signOut();
