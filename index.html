@@ -45,6 +45,11 @@ svg{display:block;}
 .tab{border:1px solid var(--line);background:var(--card);color:var(--ink);padding:6px 13px;border-radius:20px;font-size:12.5px;cursor:pointer;white-space:nowrap;}
 .tab.active{background:var(--accent);color:#fff;border-color:var(--accent);}
 .error-banner{margin:10px 18px 0;background:#FBE7E1;color:var(--danger);padding:8px 12px;border-radius:8px;font-size:12.5px;}
+.sync-info{margin:10px 18px 0;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px;font-size:12.5px;line-height:1.7;}
+.sync-info strong{font-weight:700;}
+.sync-ok{color:var(--paid);}
+.sync-warn{color:var(--due);}
+.small-btn{width:100%;margin-top:6px;padding:10px;border-radius:9px;border:1px solid var(--line);background:var(--card);color:var(--ink);font-size:13px;}
 .list{padding:14px 18px 90px;display:flex;flex-direction:column;gap:10px;}
 .empty-state{text-align:center;padding:50px 20px;color:#6B6558;}
 .empty-state p{margin:4px 0;}
@@ -190,6 +195,27 @@ function fmtCloudError(e){
   return msg || "تعذر الاتصال بالسحابة.";
 }
 
+async function rememberLastSync(iso){
+  try{
+    const db=await openDB();
+    await new Promise((resolve,reject)=>{
+      const tx=db.transaction("sync_meta","readwrite");
+      tx.objectStore("sync_meta").put({id:"lastSync",kind:"lastSync",value:iso});
+      tx.oncomplete=()=>resolve(); tx.onerror=()=>reject(tx.error);
+    });
+  }catch{}
+}
+async function getRememberedLastSync(){
+  try{
+    const db=await openDB();
+    return await new Promise((resolve,reject)=>{
+      const tx=db.transaction("sync_meta","readonly");
+      const req=tx.objectStore("sync_meta").get("lastSync");
+      req.onsuccess=()=>resolve(req.result?.value||null); req.onerror=()=>reject(req.error);
+    });
+  }catch{return null;}
+}
+
 function cloudLabel(){
   if(cloud.busy)return"جارِ المزامنة…";
   if(cloud.user)return cloud.lastSync?`تمت المزامنة ${fmtDateTime(cloud.lastSync)}`:"متصل بالسحابة";
@@ -199,9 +225,11 @@ function fmtDateTime(iso){
   try{return new Date(iso).toLocaleString("ar-SA",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"});}catch{return"";}
 }
 function scheduleCloudSync(){
-  if(!cloud.user||!navigator.onLine)return;
+  if(!navigator.onLine||!cloud.user)return;
   clearTimeout(syncTimer);
-  syncTimer=setTimeout(()=>syncAll().catch(()=>{}),900);
+  // Short queue window prevents several keystroke/save events from racing each other.
+  // The local IndexedDB write is already complete before this is called.
+  syncTimer=setTimeout(()=>{syncTimer=null;syncAll().catch(()=>{});},250);
 }
 function saleToCloud(sale,userId){
   return{
@@ -374,6 +402,7 @@ async function syncAll(){
     }
 
     cloud.lastSync=new Date().toISOString();
+    await rememberLastSync(cloud.lastSync);
     cloud.status="تمت المزامنة";
     await refreshSales();
     if(state.view==="list")renderListOnly();else if(document.getElementById("root"))render();
@@ -411,8 +440,10 @@ async function renderAuthBody(message=""){
   const body=document.getElementById("authBody");if(!body)return;
   if(cloud.user){
     body.innerHTML=`<div class="hint">الحساب: <b>${esc(cloud.user.email||"حسابك")}</b><br>${esc(cloudLabel())}</div>
+      <div class="sync-info"><b>أين بياناتي؟</b><br>• نسخة العمل: محفوظة على هذا الجهاز داخل تخزين التطبيق (IndexedDB).<br>• النسخة السحابية: محفوظة في حسابك داخل Supabase، ويمكنك الوصول لها من لوحة المشروع.<br>• بدون إنترنت: التطبيق يستمر بالعمل، وعند عودة الإنترنت تُرفع التغييرات تلقائيًا.<br>• كل حفظ أو تعديل يحدّث النسخة السحابية تلقائيًا عندما يكون الحساب متصلًا.</div>
       ${cloud.error?`<div class="modal-error">${ICONS.alert}<span>${esc(cloud.error)}</span></div>`:""}
       <button class="btn-secondary full" id="syncNowBtn">☁️ مزامنة الآن</button>
+      <button class="small-btn" id="openCloudBtn">فتح مكان البيانات السحابية</button>
       <button class="btn-ghost" id="testCloudBtn" style="width:100%;margin-top:6px;">اختبار الاتصال بالسحابة</button>
       <button class="btn-ghost" id="signOutBtn" style="width:100%;margin-top:6px;">تسجيل الخروج</button>`;
     document.getElementById("syncNowBtn").onclick=async()=>{
@@ -420,6 +451,9 @@ async function renderAuthBody(message=""){
       if(btn){btn.disabled=true;btn.textContent="جارِ المزامنة…";}
       const ok=await syncAll();
       renderAuthBody(ok?"تمت المزامنة ✓":"تعذر إتمام المزامنة");
+    };
+    document.getElementById("openCloudBtn").onclick=()=>{
+      window.open("https://supabase.com/dashboard/project/cxjigxowbdzhlthvweio/editor", "_blank", "noopener,noreferrer");
     };
     document.getElementById("testCloudBtn").onclick=async()=>{
       const btn=document.getElementById("testCloudBtn");
@@ -449,7 +483,7 @@ async function renderAuthBody(message=""){
     <div class="field"><label>كلمة المرور</label><input id="authPassword" type="password" autocomplete="current-password" placeholder="8 أحرف أو أكثر"></div>
     <button class="btn-primary" id="loginBtn">تسجيل الدخول</button>
     <button class="btn-ghost" id="signupBtn" style="width:100%;margin-top:6px;">إنشاء حساب جديد</button>
-    <div class="muted" style="text-align:center;margin-top:8px">الحساب هو مفتاح مزامنة بياناتك بين الأجهزة.</div>`;
+    <div class="sync-info"><b>مهم في الآيفون:</b> Chrome ونسخة الشاشة الرئيسية قد يكون لكل واحد منهما تخزين محلي مستقل. هذا طبيعي. لا تعتمد بياناتك على أحدهما: عند تسجيل الدخول بنفس الحساب، السحابة هي التي تنقل بياناتك بينهما.</div>`;
   const act=async(mode)=>{
     const email=document.getElementById("authEmail").value.trim();
     const password=document.getElementById("authPassword").value;
@@ -471,6 +505,7 @@ async function renderAuthBody(message=""){
 }
 
 async function initCloud(){
+  cloud.lastSync=await getRememberedLastSync();
   try{
     const {data,error}=await supabaseClient.auth.getSession();
     if(error)throw error;
@@ -497,7 +532,7 @@ async function initCloud(){
   }
 }
 window.addEventListener("online",()=>{if(cloud.user)syncAll().catch(()=>{});});
-window.addEventListener("offline",()=>{cloud.status="غير متصل بالإنترنت";updateCloudIndicator();});
+window.addEventListener("offline",()=>{cloud.status="غير متصل بالإنترنت — البيانات المحلية مستمرة";updateCloudIndicator();});
 </script>
 
 <script>
@@ -831,7 +866,7 @@ function refreshListCardClip(id,hasReceipt){
   if(state.view==="detail"&&state.selectedId===id){const sale=getSelected();if(sale)bindDetailEvents();}
 }
 init();
-if("serviceWorker"in navigator)window.addEventListener("load",()=>{navigator.serviceWorker.register("sw.js?v=3").catch(()=>{});});
+if("serviceWorker"in navigator)window.addEventListener("load",()=>{navigator.serviceWorker.register("sw.js?v=4").catch(()=>{});});
 </script>
 </body>
 </html>
