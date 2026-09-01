@@ -131,29 +131,64 @@ svg{display:block;}
 <body>
 <div id="root"></div>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-<script src="supabase-config.js"></script>
+<script>
+/* Supabase configuration is intentionally embedded so this index.html is standalone.
+   Only the public/publishable key belongs here. Never put a service_role key in this file. */
+window.INSTALLMENT_SUPABASE_CONFIG = {
+  url: "https://cxjigxowbdzhlthvweio.supabase.co",
+  publishableKey: "sb_publishable_S6g9b2lUIj9TjIuPFID3gA_S5FYL4W_",
+  bucket: "installment-receipts"
+};
+</script>
 <script>
 /* ---------------- Cloud Sync / Supabase ---------------- */
 const cfg = window.INSTALLMENT_SUPABASE_CONFIG || {};
 const SUPABASE_URL = cfg.url;
 const SUPABASE_PUBLISHABLE_KEY = cfg.publishableKey;
-const SUPABASE_BUCKET = cfg.bucket || "receipts";
+const SUPABASE_BUCKET = cfg.bucket || "installment-receipts";
 
-const cloud = {user:null,busy:false,status:"غير متصل",lastSync:null,error:null};
+const cloud = {
+  user:null,
+  session:null,
+  busy:false,
+  status:"غير متصل",
+  lastSync:null,
+  error:null,
+  lastErrorCode:null
+};
 let syncTimer=null;
 let syncStarted=false;
+let authListenerReady=false;
 
 function getSupabaseClient(){
   if(!SUPABASE_URL || !SUPABASE_PUBLISHABLE_KEY) throw new Error("missing-supabase-config");
   if(!window.supabase?.createClient) throw new Error("supabase-library-missing");
   if(!window._installmentSupabaseClient){
     window._installmentSupabaseClient=window.supabase.createClient(SUPABASE_URL,SUPABASE_PUBLISHABLE_KEY,{
-      auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}
+      auth:{
+        persistSession:true,
+        autoRefreshToken:true,
+        detectSessionInUrl:true,
+        flowType:"pkce"
+      }
     });
   }
   return window._installmentSupabaseClient;
 }
 const supabaseClient=getSupabaseClient();
+
+function fmtCloudError(e){
+  const msg=String(e?.message||e?.error_description||e||"");
+  const lower=msg.toLowerCase();
+  if(lower.includes("issued at future")||lower.includes("iat")||lower.includes("nbf")){
+    return "وقت الجهاز غير متزامن مع وقت الخادم. فعّل التاريخ والوقت التلقائي في الجهاز ثم أغلق التطبيق وافتحه من جديد.";
+  }
+  if(lower.includes("invalid login credentials")) return "البريد أو كلمة المرور غير صحيحة.";
+  if(lower.includes("email not confirmed")) return "أكد بريدك الإلكتروني من الرسالة التي أرسلها لك Supabase ثم سجّل الدخول.";
+  if(lower.includes("failed to fetch")||lower.includes("network")) return "لا يوجد اتصال ثابت بالإنترنت. بياناتك المحلية محفوظة وستتم المزامنة لاحقًا.";
+  if(lower.includes("jwt")) return "انتهت جلسة الدخول أو أن وقت الجهاز غير صحيح. سجّل الخروج ثم الدخول بعد تصحيح الوقت.";
+  return msg || "تعذر الاتصال بالسحابة.";
+}
 
 function cloudLabel(){
   if(cloud.busy)return"جارِ المزامنة…";
@@ -164,9 +199,9 @@ function fmtDateTime(iso){
   try{return new Date(iso).toLocaleString("ar-SA",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"});}catch{return"";}
 }
 function scheduleCloudSync(){
-  if(!cloud.user)return;
+  if(!cloud.user||!navigator.onLine)return;
   clearTimeout(syncTimer);
-  syncTimer=setTimeout(()=>syncAll().catch(()=>{}),1200);
+  syncTimer=setTimeout(()=>syncAll().catch(()=>{}),900);
 }
 function saleToCloud(sale,userId){
   return{
@@ -201,16 +236,18 @@ async function cloudDownloadReceipt(saleId){
 }
 async function cloudDeleteReceipt(saleId){
   if(!cloud.user)return;
-  await supabaseClient.storage.from(SUPABASE_BUCKET).remove([`${cloud.user.id}/${saleId}.jpg`]);
+  const {error}=await supabaseClient.storage.from(SUPABASE_BUCKET).remove([`${cloud.user.id}/${saleId}.jpg`]);
+  if(error && !/not found/i.test(error.message||"")) throw error;
 }
 async function uploadSale(sale){
+  if(!cloud.user)throw new Error("not-authenticated");
   const {error}=await supabaseClient.from("installment_sales").upsert(saleToCloud(sale,cloud.user.id),{onConflict:"id"});
   if(error)throw error;
   if(sale.hasReceipt){
     const blob=await dbGetReceipt(sale.id);
     if(blob)await cloudUploadReceipt(sale.id,blob);
   }else{
-    await cloudDeleteReceipt(sale.id);
+    try{await cloudDeleteReceipt(sale.id);}catch{}
   }
 }
 async function applyRemoteSale(row){
@@ -218,7 +255,7 @@ async function applyRemoteSale(row){
   await dbPutSale(sale,{stamp:false});
   if(sale.hasReceipt){
     const blob=await cloudDownloadReceipt(sale.id);
-    if(blob)await dbPutReceipt(sale.id,blob);
+    if(blob)await dbPutReceipt(sale.id,blob,{sync:false});
   }else{
     try{await dbDeleteReceipt(sale.id);}catch{}
   }
@@ -231,10 +268,13 @@ function localUpdatedAt(sale){
   const t=new Date(sale?.updatedAt||sale?.createdAt||0).getTime();
   return Number.isFinite(t)?t:0;
 }
+
 async function syncAll(){
-  if(!cloud.user||cloud.busy)return;
-  cloud.busy=true;cloud.status="جارِ المزامنة…";cloud.error=null;updateCloudIndicator();
+  if(!cloud.user||cloud.busy||!navigator.onLine)return false;
+  cloud.busy=true;cloud.status="جارِ المزامنة…";cloud.error=null;cloud.lastErrorCode=null;updateCloudIndicator();
   try{
+    /* Pull both live rows and deletion markers first. This makes a fresh browser
+       download the user's cloud data instead of treating an empty IndexedDB as authoritative. */
     const [{data:remoteSales,error:salesErr},{data:remoteDeletes,error:delErr}]=await Promise.all([
       supabaseClient.from("installment_sales").select("*").eq("user_id",cloud.user.id),
       supabaseClient.from("installment_sale_deletions").select("*").eq("user_id",cloud.user.id)
@@ -242,33 +282,34 @@ async function syncAll(){
     if(salesErr)throw salesErr;
     if(delErr)throw delErr;
 
-    const localSales=await dbGetAllSales();
+    let localSales=await dbGetAllSales();
     const remoteMap=new Map((remoteSales||[]).map(r=>[r.id,r]));
     const deletedMap=new Map((remoteDeletes||[]).map(r=>[r.id,r]));
 
+    /* First apply cloud deletions to local data. */
     for(const sale of localSales){
       const tomb=deletedMap.get(sale.id);
       const lt=localUpdatedAt(sale);
       if(tomb && new Date(tomb.deleted_at).getTime()>=lt){
         await dbDeleteSale(sale.id,{sync:false});
         try{await dbDeleteReceipt(sale.id);}catch{}
-        continue;
       }
+    }
+
+    /* Upload local changes only when they are newer than the cloud copy. */
+    localSales=await dbGetAllSales();
+    for(const sale of localSales){
+      const tomb=deletedMap.get(sale.id);
+      if(tomb && new Date(tomb.deleted_at).getTime()>=localUpdatedAt(sale))continue;
       const remote=remoteMap.get(sale.id);
       if(!remote){
         await uploadSale(sale);
-      }else if(lt>remoteUpdatedAt(remote)){
+      }else if(localUpdatedAt(sale)>remoteUpdatedAt(remote)){
         await uploadSale(sale);
-      }else if(remoteUpdatedAt(remote)>lt){
-        await applyRemoteSale(remote);
       }
     }
 
-    const localIds=new Set((await dbGetAllSales()).map(s=>s.id));
-    for(const remote of (remoteSales||[])){
-      if(!localIds.has(remote.id)&&!deletedMap.has(remote.id))await applyRemoteSale(remote);
-    }
-
+    /* Push local deletion markers and delete the cloud row. */
     const tombstones=await dbGetAllTombstones();
     for(const t of tombstones){
       const {error:e1}=await supabaseClient.from("installment_sale_deletions")
@@ -280,14 +321,49 @@ async function syncAll(){
       await dbDeleteTombstone(t.saleId);
     }
 
+    /* Pull again after uploads/deletes so both devices converge to the same state. */
+    const [{data:latest,error:latestErr},{data:latestDeletes,error:latestDelErr}]=await Promise.all([
+      supabaseClient.from("installment_sales").select("*").eq("user_id",cloud.user.id),
+      supabaseClient.from("installment_sale_deletions").select("*").eq("user_id",cloud.user.id)
+    ]);
+    if(latestErr)throw latestErr;
+    if(latestDelErr)throw latestDelErr;
+    const latestDeleted=new Map((latestDeletes||[]).map(r=>[r.id,r]));
+    const latestLocal=await dbGetAllSales();
+    const latestLocalMap=new Map(latestLocal.map(s=>[s.id,s]));
+
+    for(const remote of (latest||[])){
+      const tomb=latestDeleted.get(remote.id);
+      if(tomb && new Date(tomb.deleted_at).getTime()>=remoteUpdatedAt(remote))continue;
+      const local=latestLocalMap.get(remote.id);
+      if(!local || remoteUpdatedAt(remote)>localUpdatedAt(local))await applyRemoteSale(remote);
+      else if(local && remote.has_receipt && !local.hasReceipt){
+        const blob=await cloudDownloadReceipt(remote.id);
+        if(blob)await dbPutReceipt(remote.id,blob,{sync:false});
+      }
+    }
+
+    /* Keep local rows that are absent remotely only if they are newer; otherwise
+       a remote deletion marker wins. */
+    for(const local of await dbGetAllSales()){
+      const tomb=latestDeleted.get(local.id);
+      if(tomb && new Date(tomb.deleted_at).getTime()>=localUpdatedAt(local)){
+        await dbDeleteSale(local.id,{sync:false});
+        try{await dbDeleteReceipt(local.id);}catch{}
+      }
+    }
+
     cloud.lastSync=new Date().toISOString();
     cloud.status="تمت المزامنة";
     await refreshSales();
-    if(state.view==="list")renderListOnly();else render();
+    if(state.view==="list")renderListOnly();else if(document.getElementById("root"))render();
+    return true;
   }catch(e){
     console.error("Cloud sync failed",e);
     cloud.status="تعذر الاتصال";
-    cloud.error=e?.message||"sync-failed";
+    cloud.error=fmtCloudError(e);
+    cloud.lastErrorCode=e?.code||e?.status||null;
+    return false;
   }finally{
     cloud.busy=false;updateCloudIndicator();
   }
@@ -321,11 +397,12 @@ async function renderAuthBody(message=""){
     document.getElementById("syncNowBtn").onclick=async()=>{
       const btn=document.getElementById("syncNowBtn");
       if(btn){btn.disabled=true;btn.textContent="جارِ المزامنة…";}
-      await syncAll();
-      renderAuthBody(cloud.error?"تعذر الاتصال أو رفضت قاعدة البيانات":"تمت المزامنة ✓");
+      const ok=await syncAll();
+      renderAuthBody(ok?"تمت المزامنة ✓":"تعذر إتمام المزامنة");
     };
     document.getElementById("signOutBtn").onclick=async()=>{
-      await supabaseClient.auth.signOut();cloud.user=null;cloud.lastSync=null;
+      await supabaseClient.auth.signOut();
+      cloud.user=null;cloud.session=null;cloud.lastSync=null;cloud.error=null;syncStarted=false;
       updateCloudIndicator();document.getElementById("authBackdrop")?.remove();render();
     };
     return;
@@ -341,18 +418,49 @@ async function renderAuthBody(message=""){
     const password=document.getElementById("authPassword").value;
     if(!email||password.length<8){renderAuthBody("أدخل بريدًا صحيحًا وكلمة مرور لا تقل عن 8 أحرف.");return;}
     body.innerHTML=`<div class="modal-busy">${ICONS.loader}<span>جارِ الاتصال…</span></div>`;
-    const r=mode==="login"?await supabaseClient.auth.signInWithPassword({email,password}):await supabaseClient.auth.signUp({email,password});
-    if(r.error){renderAuthBody(r.error.message);return;}
-    if(!r.data.session){renderAuthBody("تم إنشاء الحساب. إذا كان تأكيد البريد مفعّلًا، افتح رسالة البريد ثم عد للتطبيق.");return;}
-    cloud.user=r.data.user;await syncAll();renderAuthBody(cloud.error?"تم تسجيل الدخول لكن المزامنة فشلت":"تم الربط والمزامنة ✓");updateCloudIndicator();
+    try{
+      const r=mode==="login"
+        ? await supabaseClient.auth.signInWithPassword({email,password})
+        : await supabaseClient.auth.signUp({email,password});
+      if(r.error){renderAuthBody(fmtCloudError(r.error));return;}
+      if(!r.data.session){renderAuthBody("تم إنشاء الحساب. إذا كان تأكيد البريد مفعّلًا، افتح رسالة البريد ثم عد للتطبيق.");return;}
+      cloud.session=r.data.session;cloud.user=r.data.user;syncStarted=false;
+      const ok=await syncAll();
+      renderAuthBody(ok?"تم الربط والمزامنة ✓":"تم تسجيل الدخول، لكن تعذر إتمام المزامنة");updateCloudIndicator();
+    }catch(e){renderAuthBody(fmtCloudError(e));}
   };
   document.getElementById("loginBtn").onclick=()=>act("login");
   document.getElementById("signupBtn").onclick=()=>act("signup");
 }
-supabaseClient.auth.onAuthStateChange((event,session)=>{
-  cloud.user=session?.user||null;updateCloudIndicator();
-  if(session&&!syncStarted){syncStarted=true;setTimeout(()=>syncAll().catch(()=>{}),300);}
-});
+
+async function initCloud(){
+  try{
+    const {data,error}=await supabaseClient.auth.getSession();
+    if(error)throw error;
+    cloud.session=data.session||null;
+    cloud.user=data.session?.user||null;
+    updateCloudIndicator();
+    if(cloud.user){syncStarted=true;setTimeout(()=>syncAll().catch(()=>{}),250);}
+  }catch(e){
+    cloud.user=null;cloud.session=null;cloud.error=fmtCloudError(e);updateCloudIndicator();
+  }
+  if(!authListenerReady){
+    authListenerReady=true;
+    supabaseClient.auth.onAuthStateChange((event,session)=>{
+      cloud.session=session||null;
+      cloud.user=session?.user||null;
+      if(event==="SIGNED_OUT"){
+        syncStarted=false;cloud.lastSync=null;cloud.error=null;
+      }else if(session){
+        syncStarted=true;
+        setTimeout(()=>syncAll().catch(()=>{}),100);
+      }
+      updateCloudIndicator();
+    });
+  }
+}
+window.addEventListener("online",()=>{if(cloud.user)syncAll().catch(()=>{});});
+window.addEventListener("offline",()=>{cloud.status="غير متصل بالإنترنت";updateCloudIndicator();});
 </script>
 
 <script>
@@ -398,11 +506,11 @@ async function dbDeleteSale(id,options={}){
     tx.oncomplete=()=>{resolve(true);if(options.sync!==false)scheduleCloudSync();};tx.onerror=()=>reject(tx.error);
   });
 }
-async function dbPutReceipt(id,blob){
+async function dbPutReceipt(id,blob,options={}){
   const db=await openDB();
   return new Promise((resolve,reject)=>{
     const tx=db.transaction("receipts","readwrite");tx.objectStore("receipts").put({id,blob});
-    tx.oncomplete=()=>{resolve(true);scheduleCloudSync();};tx.onerror=()=>reject(tx.error);
+    tx.oncomplete=()=>{resolve(true);if(options.sync!==false)scheduleCloudSync();};tx.onerror=()=>reject(tx.error);
   });
 }
 async function dbGetReceipt(id){
@@ -500,10 +608,7 @@ async function init(){
   try{
     await refreshSales();
     if(navigator.storage?.persist){try{await navigator.storage.persist();}catch{}}
-    const {data:{session}}=await supabaseClient.auth.getSession();
-    cloud.user=session?.user||null;
-    updateCloudIndicator();
-    if(cloud.user)setTimeout(()=>syncAll().catch(()=>{}),500);
+    await initCloud();
   }catch(e){state.errorMsg="تعذر تحميل البيانات المحفوظة";}
   state.loading=false;render();
 }
@@ -689,7 +794,7 @@ function refreshListCardClip(id,hasReceipt){
   if(state.view==="detail"&&state.selectedId===id){const sale=getSelected();if(sale)bindDetailEvents();}
 }
 init();
-if("serviceWorker"in navigator)window.addEventListener("load",()=>{navigator.serviceWorker.register("sw.js").catch(()=>{});});
+if("serviceWorker"in navigator)window.addEventListener("load",()=>{navigator.serviceWorker.register("sw.js?v=3").catch(()=>{});});
 </script>
 </body>
 </html>
