@@ -875,7 +875,10 @@ function refreshListCardClip(id,hasReceipt){
 init();
 if("serviceWorker"in navigator){
   window.addEventListener("load",()=>{
-    navigator.serviceWorker.register("sw.js?v=6").then(reg=>{
+    /* updateViaCache:'none' يمنع المتصفح من استخدام أي نسخة من sw.js محفوظة في كاش
+       Safari/WebKit العام (وهو كاش منفصل عن Cache Storage، ومشترك بين Safari وأي
+       تطبيق مضاف من الشاشة الرئيسية عبره) — يضمن فحص نسخة sw.js من الشبكة دائمًا. */
+    navigator.serviceWorker.register("sw.js?v=7",{updateViaCache:"none"}).then(reg=>{
       // إن كان هناك إصدار جديد من sw.js ينتظر التفعيل، فعّله فورًا (skipWaiting موجود داخل sw.js نفسه).
       if(reg.waiting)reg.waiting.postMessage({type:"SKIP_WAITING"});
     }).catch(()=>{});
