@@ -135,7 +135,14 @@ svg{display:block;}
 </head>
 <body>
 <div id="root"></div>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+/* هذا السكربت (v5 القديم) كان يحذف الـ Service Worker والكاش مرة واحدة بالاعتماد على
+   علم مخزّن في localStorage. المشكلة أن localStorage نفسه منفصل بين Chrome ونسخة
+   الشاشة الرئيسية على آيفون، فكان هذا "الحل" غير موثوق أصلًا ولا يمنع تكرار المشكلة.
+   تمت إزالته نهائيًا؛ الآن sw.js الجديد (v6) يتولى تحديث نفسه تلقائيًا وبشكل صحيح،
+   ولا يخزّن أبدًا ردود Supabase (راجع sw.js) — فلا حاجة لأي حيلة يدوية هنا. */
+</script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.113.0"></script>
 <script>
 /* Supabase configuration is intentionally embedded so this index.html is standalone.
    Only the public/publishable key belongs here. Never put a service_role key in this file. */
@@ -866,7 +873,20 @@ function refreshListCardClip(id,hasReceipt){
   if(state.view==="detail"&&state.selectedId===id){const sale=getSelected();if(sale)bindDetailEvents();}
 }
 init();
-if("serviceWorker"in navigator)window.addEventListener("load",()=>{navigator.serviceWorker.register("sw.js?v=4").catch(()=>{});});
+if("serviceWorker"in navigator){
+  window.addEventListener("load",()=>{
+    navigator.serviceWorker.register("sw.js?v=6").then(reg=>{
+      // إن كان هناك إصدار جديد من sw.js ينتظر التفعيل، فعّله فورًا (skipWaiting موجود داخل sw.js نفسه).
+      if(reg.waiting)reg.waiting.postMessage({type:"SKIP_WAITING"});
+    }).catch(()=>{});
+    // عند تولي Service Worker جديد التحكم (تحديث حقيقي)، أعد تحميل الصفحة مرة واحدة فقط
+    // حتى تُستخدم أحدث نسخة من index.html والمكتبات، دون المساس بـ IndexedDB إطلاقًا.
+    let refreshed=false;
+    navigator.serviceWorker.addEventListener("controllerchange",()=>{
+      if(refreshed)return;refreshed=true;location.reload();
+    });
+  });
+}
 </script>
 </body>
 </html>
