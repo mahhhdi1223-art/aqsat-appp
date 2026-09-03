@@ -113,6 +113,15 @@ svg{display:block;}
 .upload-btn{display:flex;align-items:center;justify-content:center;gap:7px;border:1px dashed var(--line);background:var(--card);padding:14px;border-radius:10px;color:#6B6558;font-size:13.5px;cursor:pointer;width:100%;}
 .link-btn{background:none;border:none;color:var(--accent);font-size:12.5px;cursor:pointer;text-decoration:underline;padding:0;display:inline-flex;align-items:center;gap:4px;}
 .link-btn.danger{color:var(--danger);}
+.trash-row{display:flex;align-items:center;gap:10px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px;}
+.trash-row-body{flex:1;min-width:0;}
+.trash-row-name{font-weight:700;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.trash-row-meta{font-size:11.5px;color:#8C8676;margin-top:3px;}
+.trash-actions{display:flex;gap:6px;flex-shrink:0;}
+.btn-small{border:1px solid var(--line);background:var(--card);color:var(--ink);padding:7px 9px;border-radius:8px;font-size:11.5px;cursor:pointer;}
+.btn-small.restore{border-color:var(--paid);color:var(--paid);}
+.btn-small.delete{border-color:var(--danger);color:var(--danger);}
+.trash-note{font-size:12px;color:#6B6558;background:var(--card);border:1px dashed var(--line);border-radius:9px;padding:9px 10px;line-height:1.6;}
 .form-actions{display:flex;gap:8px;margin-top:4px;}
 .btn-primary{flex:1;background:var(--accent);color:#fff;border:none;padding:12px;border-radius:10px;font-size:14.5px;font-weight:700;cursor:pointer;}
 .btn-primary:disabled{opacity:.6;cursor:default;}
@@ -274,6 +283,16 @@ async function cloudDeleteReceipt(saleId){
   const {error}=await supabaseClient.storage.from(SUPABASE_BUCKET).remove([`${cloud.user.id}/${saleId}.jpg`]);
   if(error && !/not found/i.test(error.message||"")) throw error;
 }
+async function cloudDeleteDeletionMarker(saleId){
+  if(!cloud.user)return;
+  const {error}=await supabaseClient.from("installment_sale_deletions").delete().eq("id",saleId).eq("user_id",cloud.user.id);
+  if(error)throw error;
+}
+async function cloudPushTrash(sale,deletedAt){
+  if(!cloud.user)return;
+  const {error}=await supabaseClient.from("installment_sale_deletions").insert({id:sale.id,user_id:cloud.user.id,deleted_at:deletedAt||new Date().toISOString(),sale_data:sale});
+  if(error && error.code!=="23505")throw error;
+}
 async function uploadSale(sale){
   if(!cloud.user)throw new Error("not-authenticated");
   const {error}=await supabaseClient.from("installment_sales").upsert(saleToCloud(sale,cloud.user.id),{onConflict:"id"});
@@ -335,14 +354,23 @@ async function syncAll(){
     let localSales=await dbGetAllSales();
     const remoteMap=new Map((remoteSales||[]).map(r=>[r.id,r]));
     const deletedMap=new Map((remoteDeletes||[]).map(r=>[r.id,r]));
+    const pendingRestores=new Set((await dbGetAllRestoreMarkers()).map(r=>r.saleId));
+    const pendingPurges=new Set((await dbGetAllPurgeMarkers()).map(r=>r.saleId));
 
-    /* First apply cloud deletions to local data. */
+    /* First apply cloud deletions to local data and preserve a recoverable trash copy. */
     for(const sale of localSales){
       const tomb=deletedMap.get(sale.id);
       const lt=localUpdatedAt(sale);
-      if(tomb && new Date(tomb.deleted_at).getTime()>=lt){
+      if(tomb && !pendingRestores.has(sale.id) && !pendingPurges.has(sale.id) && new Date(tomb.deleted_at).getTime()>=lt){
+        await dbPutTrash(tomb.sale_data||sale,tomb.deleted_at);
         await dbDeleteSale(sale.id,{sync:false});
-        try{await dbDeleteReceipt(sale.id);}catch{}
+      }
+    }
+    for(const tomb of (remoteDeletes||[])){
+      if(pendingRestores.has(tomb.id)||pendingPurges.has(tomb.id))continue;
+      if(tomb.sale_data){
+        const localTrash=await dbGetTrash(tomb.id);
+        if(!localTrash || new Date(tomb.deleted_at).getTime()>new Date(localTrash.deletedAt||0).getTime()) await dbPutTrash(tomb.sale_data,tomb.deleted_at);
       }
     }
 
@@ -359,21 +387,39 @@ async function syncAll(){
       }
     }
 
-    /* Push local deletion markers and delete the cloud row. */
+    /* Push local trash markers, keep them in the cloud for recovery, and remove the live row. */
     const tombstones=await dbGetAllTombstones();
     for(const t of tombstones){
-      /* Insert the tombstone instead of upsert. The table has RLS and upsert
-         can invoke the UPDATE/USING policy on an existing key, which causes
-         "violates row-level security policy (USING expression)" errors.
-         A duplicate tombstone is already in the desired state, so it is safe
-         to ignore only duplicate-key errors. */
-      const {error:e1}=await supabaseClient.from("installment_sale_deletions")
-        .insert({id:t.saleId,user_id:cloud.user.id,deleted_at:t.deletedAt});
-      if(e1 && e1.code!=="23505")throw e1;
+      const trash=await dbGetTrash(t.saleId);
+      const snapshot=trash?.sale||t.sale;
+      if(snapshot)await cloudPushTrash(snapshot,t.deletedAt);
+      else{
+        const {error:e1}=await supabaseClient.from("installment_sale_deletions").insert({id:t.saleId,user_id:cloud.user.id,deleted_at:t.deletedAt});
+        if(e1 && e1.code!=="23505")throw e1;
+      }
       const {error:e2}=await supabaseClient.from("installment_sales").delete().eq("id",t.saleId).eq("user_id",cloud.user.id);
       if(e2)throw e2;
-      try{await cloudDeleteReceipt(t.saleId);}catch{}
-      await dbDeleteTombstone(t.saleId);
+    }
+
+    /* Restore requests created while offline must remove the cloud deletion first. */
+    const restores=await dbGetAllRestoreMarkers();
+    for(const r of restores){
+      await cloudDeleteDeletionMarker(r.saleId);
+      const sale=await dbGetSale(r.saleId);
+      if(sale){
+        if(sale.hasReceipt){const blob=await dbGetReceipt(sale.id);if(!blob){const remoteBlob=await cloudDownloadReceipt(sale.id);if(remoteBlob)await dbPutReceipt(sale.id,remoteBlob,{sync:false});}}
+        await uploadSale(sale);
+      }
+      await dbDeleteRestoreMarker(r.saleId);
+    }
+
+    /* Permanent-delete requests created while offline. */
+    const purges=await dbGetAllPurgeMarkers();
+    for(const r of purges){
+      await cloudDeleteDeletionMarker(r.saleId);
+      try{await cloudDeleteReceipt(r.saleId);}catch{}
+      await dbDeleteTrash(r.saleId);
+      await dbDeletePurgeMarker(r.saleId);
     }
 
     /* Pull again after uploads/deletes so both devices converge to the same state. */
@@ -389,6 +435,7 @@ async function syncAll(){
 
     for(const remote of (latest||[])){
       const tomb=latestDeleted.get(remote.id);
+      if((pendingRestores.has(remote.id)||pendingPurges.has(remote.id)))continue;
       if(tomb && new Date(tomb.deleted_at).getTime()>=remoteUpdatedAt(remote))continue;
       const local=latestLocalMap.get(remote.id);
       if(!local || remoteUpdatedAt(remote)>localUpdatedAt(local))await applyRemoteSale(remote);
@@ -402,9 +449,9 @@ async function syncAll(){
        a remote deletion marker wins. */
     for(const local of await dbGetAllSales()){
       const tomb=latestDeleted.get(local.id);
+      if((pendingRestores.has(local.id)||pendingPurges.has(local.id)))continue;
       if(tomb && new Date(tomb.deleted_at).getTime()>=localUpdatedAt(local)){
         await dbDeleteSale(local.id,{sync:false});
-        try{await dbDeleteReceipt(local.id);}catch{}
       }
     }
 
@@ -578,7 +625,7 @@ async function dbPutSale(sale,options={}){
   });
 }
 async function dbDeleteSale(id,options={}){
-  if(options.sync!==false){try{await dbPutTombstone(id);}catch{}}
+  if(options.sync!==false){try{const existing=await dbGetSale(id);if(existing)await dbPutTombstone(id,existing);}catch{}}
   const db=await openDB();
   return new Promise((resolve,reject)=>{
     const tx=db.transaction("sales","readwrite");tx.objectStore("sales").delete(id);
@@ -606,13 +653,70 @@ async function dbDeleteReceipt(id){
     tx.oncomplete=()=>resolve(true);tx.onerror=()=>reject(tx.error);
   });
 }
-async function dbPutTombstone(id){
+async function dbGetSale(id){
+  const db=await openDB();
+  return new Promise((resolve,reject)=>{
+    const tx=db.transaction("sales","readonly"),req=tx.objectStore("sales").get(id);
+    req.onsuccess=()=>resolve(req.result||null);req.onerror=()=>reject(req.error);
+  });
+}
+async function dbPutTrash(sale,deletedAt){
+  if(!sale?.id)return;
   const db=await openDB();
   return new Promise((resolve,reject)=>{
     const tx=db.transaction("sync_meta","readwrite");
-    tx.objectStore("sync_meta").put({id:`deleted:${id}`,kind:"deleted",saleId:id,deletedAt:new Date().toISOString()});
+    tx.objectStore("sync_meta").put({id:`trash:${sale.id}`,kind:"trash",sale:{...sale},saleId:sale.id,deletedAt:deletedAt||new Date().toISOString()});
     tx.oncomplete=()=>resolve(true);tx.onerror=()=>reject(tx.error);
   });
+}
+async function dbGetTrash(id){
+  const db=await openDB();
+  return new Promise((resolve,reject)=>{
+    const tx=db.transaction("sync_meta","readonly"),req=tx.objectStore("sync_meta").get(`trash:${id}`);
+    req.onsuccess=()=>resolve(req.result||null);req.onerror=()=>reject(req.error);
+  });
+}
+async function dbGetAllTrash(){
+  const db=await openDB();
+  return new Promise((resolve,reject)=>{
+    const tx=db.transaction("sync_meta","readonly"),req=tx.objectStore("sync_meta").getAll();
+    req.onsuccess=()=>resolve((req.result||[]).filter(x=>x.kind==="trash").sort((a,b)=>new Date(b.deletedAt)-new Date(a.deletedAt)));req.onerror=()=>reject(req.error);
+  });
+}
+async function dbDeleteTrash(id){
+  const db=await openDB();
+  return new Promise((resolve,reject)=>{
+    const tx=db.transaction("sync_meta","readwrite");tx.objectStore("sync_meta").delete(`trash:${id}`);
+    tx.oncomplete=()=>resolve(true);tx.onerror=()=>reject(tx.error);
+  });
+}
+async function dbPutTombstone(id,sale){
+  const deletedAt=new Date().toISOString();
+  await dbPutTrash(sale,deletedAt);
+  const db=await openDB();
+  return new Promise((resolve,reject)=>{
+    const tx=db.transaction("sync_meta","readwrite");
+    tx.objectStore("sync_meta").put({id:`deleted:${id}`,kind:"deleted",saleId:id,deletedAt,sale:{...sale}});
+    tx.oncomplete=()=>resolve(true);tx.onerror=()=>reject(tx.error);
+  });
+}
+async function dbPutRestoreMarker(id){
+  const db=await openDB();return new Promise((resolve,reject)=>{const tx=db.transaction("sync_meta","readwrite");tx.objectStore("sync_meta").put({id:`restore:${id}`,kind:"restore",saleId:id,at:new Date().toISOString()});tx.oncomplete=()=>resolve(true);tx.onerror=()=>reject(tx.error);});
+}
+async function dbGetAllRestoreMarkers(){
+  const db=await openDB();return new Promise((resolve,reject)=>{const tx=db.transaction("sync_meta","readonly"),req=tx.objectStore("sync_meta").getAll();req.onsuccess=()=>resolve((req.result||[]).filter(x=>x.kind==="restore"));req.onerror=()=>reject(req.error);});
+}
+async function dbDeleteRestoreMarker(id){
+  const db=await openDB();return new Promise((resolve,reject)=>{const tx=db.transaction("sync_meta","readwrite");tx.objectStore("sync_meta").delete(`restore:${id}`);tx.oncomplete=()=>resolve(true);tx.onerror=()=>reject(tx.error);});
+}
+async function dbPutPurgeMarker(id){
+  const db=await openDB();return new Promise((resolve,reject)=>{const tx=db.transaction("sync_meta","readwrite");tx.objectStore("sync_meta").put({id:`purge:${id}`,kind:"purge",saleId:id,at:new Date().toISOString()});tx.oncomplete=()=>resolve(true);tx.onerror=()=>reject(tx.error);});
+}
+async function dbGetAllPurgeMarkers(){
+  const db=await openDB();return new Promise((resolve,reject)=>{const tx=db.transaction("sync_meta","readonly"),req=tx.objectStore("sync_meta").getAll();req.onsuccess=()=>resolve((req.result||[]).filter(x=>x.kind==="purge"));req.onerror=()=>reject(req.error);});
+}
+async function dbDeletePurgeMarker(id){
+  const db=await openDB();return new Promise((resolve,reject)=>{const tx=db.transaction("sync_meta","readwrite");tx.objectStore("sync_meta").delete(`purge:${id}`);tx.oncomplete=()=>resolve(true);tx.onerror=()=>reject(tx.error);});
 }
 async function dbGetAllTombstones(){
   const db=await openDB();
@@ -677,11 +781,11 @@ const ICONS={
   download:`<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`,
   upload:`<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>`
 };
-const state={loading:true,sales:[],view:"list",selectedId:null,search:"",filter:"all",errorMsg:null,attachId:null,showBackup:false,addingPayment:false,confirmDeleteSale:false};
+const state={loading:true,sales:[],trash:[],view:"list",selectedId:null,search:"",filter:"all",errorMsg:null,attachId:null,showBackup:false,showTrash:false,addingPayment:false,confirmDeleteSale:false};
 let activeObjectUrls=[];
 function trackObjectUrl(url){activeObjectUrls.push(url);return url;}
 function revokeTrackedUrls(){activeObjectUrls.forEach(u=>URL.revokeObjectURL(u));activeObjectUrls=[];}
-async function refreshSales(){state.sales=await dbGetAllSales();}
+async function refreshSales(){state.sales=await dbGetAllSales();state.trash=await dbGetAllTrash();}
 function root(){return document.getElementById("root");}
 async function init(){
   try{
@@ -701,13 +805,15 @@ function render(){
   else html=renderListScreen();
   const modal=state.attachId?renderAttachModalShell():"";
   const backupModal=state.showBackup?renderBackupModalShell():"";
-  r.innerHTML=html+modal+backupModal;
+  const trashModal=state.showTrash?renderTrashModalShell():"";
+  r.innerHTML=html+modal+backupModal+trashModal;
   bindGlobalEvents();
   if(state.view==="add"||state.view==="edit")bindFormEvents();
   if(state.view==="detail")bindDetailEvents();
   if(state.view==="list")bindListEvents();
   if(state.attachId)loadAttachModalContent();
   if(state.showBackup)bindBackupModal();
+  if(state.showTrash)bindTrashModal();
 }
 function getSelected(){return state.sales.find(s=>s.id===state.selectedId);}
 function renderListScreen(){
@@ -721,7 +827,7 @@ function renderListScreen(){
     const rem=remaining(s),paidCount=paidInstallmentsCount(s),progress=s.totalAmount>0?Math.min(100,totalPaid(s)/s.totalAmount*100):0;
     return`<div class="sale-card" data-open="${s.id}"><div class="sale-card-body"><div class="sale-card-top"><span class="customer-name">${esc(s.customerName)}<button type="button" class="clip-btn ${s.hasReceipt?"attached":""}" data-attach="${s.id}" title="السند">${ICONS.clip}</button></span>${badgeHTML(s)}</div><div class="mini-progress-track"><div class="mini-progress-fill" style="width:${progress}%"></div></div><div class="sale-card-bottom"><span class="muted">${paidCount} / ${s.installmentsCount} قسط</span><span class="rem-amount">${fmtMoney(rem)} ريال متبقي</span></div></div></div>`;
   }).join("");
-  return`<div class="screen"><div class="header header-row"><h1>دفتر الأقساط</h1><div style="display:flex;align-items:center;gap:4px"><button class="icon-btn" id="cloudStatus" title="المزامنة السحابية">☁️ محلي</button><button class="icon-btn" id="backupBtn" title="نسخة احتياطية">${ICONS.backup}</button></div></div><div class="stats-row"><div class="stat-box"><span class="stat-box-value">${state.sales.length}</span><span class="stat-box-label">إجمالي العملاء</span></div><div class="stat-box highlight-due"><span class="stat-box-value">${unpaidThisMonth}</span><span class="stat-box-label">لم يسددوا هذا الشهر</span></div><div class="stat-box"><span class="stat-box-value">${fmtMoney(totalOutstanding)}</span><span class="stat-box-label">إجمالي المتبقي (ريال)</span></div></div><div class="search-row">${ICONS.search}<input id="searchInput" placeholder="بحث باسم العميل" value="${esc(state.search)}" /></div><div class="tabs"><button class="tab ${state.filter==="all"?"active":""}" data-filter="all">الكل</button><button class="tab ${state.filter==="unpaid"?"active":""}" data-filter="unpaid">لم يسدد هذا الشهر</button><button class="tab ${state.filter==="done"?"active":""}" data-filter="done">مكتمل</button></div>${state.errorMsg?`<div class="error-banner">${esc(state.errorMsg)}</div>`:""}<div class="list">${cardsHTML}</div><button class="fab" id="addBtn">${ICONS.plus}</button></div>`;
+  return`<div class="screen"><div class="header header-row"><h1>دفتر الأقساط</h1><div style="display:flex;align-items:center;gap:4px"><button class="icon-btn" id="cloudStatus" title="المزامنة السحابية">☁️ محلي</button><button class="icon-btn" id="trashBtn" title="سلة المحذوفات">🗑️${state.trash.length?`<sup style="font-size:9px;margin-right:2px;color:var(--danger)">${state.trash.length}</sup>`:""}</button><button class="icon-btn" id="backupBtn" title="نسخة احتياطية">${ICONS.backup}</button></div></div><div class="stats-row"><div class="stat-box"><span class="stat-box-value">${state.sales.length}</span><span class="stat-box-label">إجمالي العملاء</span></div><div class="stat-box highlight-due"><span class="stat-box-value">${unpaidThisMonth}</span><span class="stat-box-label">لم يسددوا هذا الشهر</span></div><div class="stat-box"><span class="stat-box-value">${fmtMoney(totalOutstanding)}</span><span class="stat-box-label">إجمالي المتبقي (ريال)</span></div></div><div class="search-row">${ICONS.search}<input id="searchInput" placeholder="بحث باسم العميل" value="${esc(state.search)}" /></div><div class="tabs"><button class="tab ${state.filter==="all"?"active":""}" data-filter="all">الكل</button><button class="tab ${state.filter==="unpaid"?"active":""}" data-filter="unpaid">لم يسدد هذا الشهر</button><button class="tab ${state.filter==="done"?"active":""}" data-filter="done">مكتمل</button></div>${state.errorMsg?`<div class="error-banner">${esc(state.errorMsg)}</div>`:""}<div class="list">${cardsHTML}</div><button class="fab" id="addBtn">${ICONS.plus}</button></div>`;
 }
 function bindListEvents(){
   const searchInput=document.getElementById("searchInput");
@@ -729,6 +835,7 @@ function bindListEvents(){
   document.querySelectorAll("[data-filter]").forEach(btn=>btn.addEventListener("click",()=>{state.filter=btn.dataset.filter;render();}));
   document.getElementById("addBtn").addEventListener("click",()=>{state.view="add";render();});
   const backupBtn=document.getElementById("backupBtn");if(backupBtn)backupBtn.addEventListener("click",()=>{state.showBackup=true;render();});
+  const trashBtn=document.getElementById("trashBtn");if(trashBtn)trashBtn.addEventListener("click",()=>{state.showTrash=true;render();});
   const cloudStatus=document.getElementById("cloudStatus");if(cloudStatus)cloudStatus.addEventListener("click",renderAuthModal);
   updateCloudIndicator();
   document.querySelectorAll("[data-open]").forEach(card=>card.addEventListener("click",e=>{if(e.target.closest("[data-attach]"))return;state.selectedId=card.dataset.open;state.view="detail";render();}));
@@ -835,6 +942,35 @@ async function importBackup(file,onProgress){
   const text=await file.text(),payload=JSON.parse(text);if(!payload||!Array.isArray(payload.sales))throw new Error("invalid-file");
   for(let i=0;i<payload.sales.length;i++){const item=payload.sales[i],{receiptDataUrl,...sale}=item;if(receiptDataUrl){const blob=await base64ToBlob(receiptDataUrl);await dbPutReceipt(sale.id,blob);sale.hasReceipt=true;}await dbPutSale(sale);if(onProgress)onProgress(i+1,payload.sales.length);}
   await refreshSales();
+}
+function renderTrashModalShell(){
+  return`<div class="modal-backdrop" id="trashBackdrop"><div class="modal-sheet" id="trashSheet"><div class="modal-head"><span>سلة المحذوفات</span><button class="icon-btn" id="trashClose">${ICONS.x}</button></div><div class="modal-body" id="trashBody"></div></div></div>`;
+}
+async function restoreSaleFromTrash(id){
+  const item=await dbGetTrash(id);if(!item?.sale)return;
+  const sale={...item.sale,updatedAt:new Date().toISOString()};
+  await dbPutSale(sale);
+  await dbDeleteTrash(id);
+  await dbDeleteTombstone(id);
+  if(!navigator.onLine||!cloud.user)await dbPutRestoreMarker(id);
+  else{try{await cloudDeleteDeletionMarker(id);if(sale.hasReceipt&&!await dbGetReceipt(sale.id)){const remoteBlob=await cloudDownloadReceipt(sale.id);if(remoteBlob)await dbPutReceipt(sale.id,remoteBlob,{sync:false});}await uploadSale(sale);}catch{await dbPutRestoreMarker(id);}}
+  await refreshSales();state.showTrash=false;state.view="list";state.selectedId=null;render();
+}
+async function permanentlyDeleteFromTrash(id){
+  await dbDeleteTrash(id);
+  await dbDeleteTombstone(id);
+  if(!navigator.onLine||!cloud.user)await dbPutPurgeMarker(id);
+  else{try{await cloudDeleteDeletionMarker(id);try{await cloudDeleteReceipt(id);}catch{}}catch{await dbPutPurgeMarker(id);}}
+  await refreshSales();render();
+}
+function bindTrashModal(){
+  const body=document.getElementById("trashBody"),close=document.getElementById("trashClose"),back=document.getElementById("trashBackdrop");
+  if(close)close.onclick=()=>{state.showTrash=false;render();};
+  if(back)back.onclick=e=>{if(e.target===back){state.showTrash=false;render();}};
+  const items=state.trash||[];
+  body.innerHTML=items.length?`<div class="trash-note">المحذوفات تبقى هنا حتى تحذفها نهائيًا أو تستعيدها. الاستعادة تعيد العميل ودفعاته وملاحظاته، وإذا كان له سند محفوظ محليًا يمكن مزامنته مع السحابة.</div>${items.map(x=>`<div class="trash-row"><div class="trash-row-body"><div class="trash-row-name">${esc(x.sale?.customerName||"عميل بدون اسم")}</div><div class="trash-row-meta">حُذف: ${fmtDate(x.deletedAt)} · ${fmtMoney(x.sale?.totalAmount||0)} ريال</div></div><div class="trash-actions"><button class="btn-small restore" data-restore="${esc(x.saleId)}">استعادة</button><button class="btn-small delete" data-purge="${esc(x.saleId)}">حذف نهائي</button></div></div>`).join("")}`:`<div class="empty-state" style="padding:30px 10px;"><p>سلة المحذوفات فارغة.</p><p class="muted">أي بيعة تحذفها ستظهر هنا ويمكن استعادتها.</p></div>`;
+  body.querySelectorAll("[data-restore]").forEach(b=>b.onclick=()=>restoreSaleFromTrash(b.dataset.restore));
+  body.querySelectorAll("[data-purge]").forEach(b=>b.onclick=async()=>{if(confirm("حذف نهائي؟ لا يمكن استعادة هذه البيعة بعد ذلك."))await permanentlyDeleteFromTrash(b.dataset.purge);});
 }
 function renderBackupModalShell(){return`<div class="modal-backdrop" id="backupBackdrop"><div class="modal-sheet" id="backupSheet"><div class="modal-head"><span>نسخة احتياطية</span><button class="icon-btn" id="backupClose">${ICONS.x}</button></div><div class="modal-body" id="backupBody"></div></div></div>`;}
 function bindBackupModal(){
