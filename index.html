@@ -387,9 +387,18 @@ async function syncAll(){
       }
     }
 
-    /* Push local trash markers, keep them in the cloud for recovery, and remove the live row. */
+    /* Push local trash markers, keep them in the cloud for recovery, and remove the live row.
+       If another device has already restored this sale, its newer updated_at wins over
+       an old offline deletion marker. This prevents an offline device from deleting
+       the sale again after it has been restored elsewhere. */
     const tombstones=await dbGetAllTombstones();
     for(const t of tombstones){
+      const {data:liveAfterRestore,error:liveErr}=await supabaseClient.from("installment_sales").select("id,updated_at").eq("id",t.saleId).eq("user_id",cloud.user.id).maybeSingle();
+      if(liveErr)throw liveErr;
+      if(liveAfterRestore && new Date(liveAfterRestore.updated_at||0).getTime()>new Date(t.deletedAt||0).getTime()){
+        await dbDeleteTombstone(t.saleId);
+        continue;
+      }
       const trash=await dbGetTrash(t.saleId);
       const snapshot=trash?.sale||t.sale;
       if(snapshot)await cloudPushTrash(snapshot,t.deletedAt);
@@ -952,8 +961,25 @@ async function restoreSaleFromTrash(id){
   await dbPutSale(sale);
   await dbDeleteTrash(id);
   await dbDeleteTombstone(id);
-  if(!navigator.onLine||!cloud.user)await dbPutRestoreMarker(id);
-  else{try{await cloudDeleteDeletionMarker(id);if(sale.hasReceipt&&!await dbGetReceipt(sale.id)){const remoteBlob=await cloudDownloadReceipt(sale.id);if(remoteBlob)await dbPutReceipt(sale.id,remoteBlob,{sync:false});}await uploadSale(sale);}catch{await dbPutRestoreMarker(id);}}
+  if(!navigator.onLine||!cloud.user){
+    await dbPutRestoreMarker(id);
+  }else{
+    try{
+      /* Delete the cloud tombstone first, then upload the restored sale with a
+         fresh updatedAt so every other device recognizes the restoration. */
+      await cloudDeleteDeletionMarker(id);
+      if(sale.hasReceipt&&!await dbGetReceipt(sale.id)){
+        const remoteBlob=await cloudDownloadReceipt(sale.id);
+        if(remoteBlob)await dbPutReceipt(sale.id,remoteBlob,{sync:false});
+      }
+      await uploadSale(sale);
+      /* Run the normal convergence pass so this device immediately settles on
+         the same state as the cloud, including receipt state. */
+      await syncAll();
+    }catch{
+      await dbPutRestoreMarker(id);
+    }
+  }
   await refreshSales();state.showTrash=false;state.view="list";state.selectedId=null;render();
 }
 async function permanentlyDeleteFromTrash(id){
@@ -968,7 +994,7 @@ function bindTrashModal(){
   if(close)close.onclick=()=>{state.showTrash=false;render();};
   if(back)back.onclick=e=>{if(e.target===back){state.showTrash=false;render();}};
   const items=state.trash||[];
-  body.innerHTML=items.length?`<div class="trash-note">المحذوفات تبقى هنا حتى تحذفها نهائيًا أو تستعيدها. الاستعادة تعيد العميل ودفعاته وملاحظاته، وإذا كان له سند محفوظ محليًا يمكن مزامنته مع السحابة.</div>${items.map(x=>`<div class="trash-row"><div class="trash-row-body"><div class="trash-row-name">${esc(x.sale?.customerName||"عميل بدون اسم")}</div><div class="trash-row-meta">حُذف: ${fmtDate(x.deletedAt)} · ${fmtMoney(x.sale?.totalAmount||0)} ريال</div></div><div class="trash-actions"><button class="btn-small restore" data-restore="${esc(x.saleId)}">استعادة</button><button class="btn-small delete" data-purge="${esc(x.saleId)}">حذف نهائي</button></div></div>`).join("")}`:`<div class="empty-state" style="padding:30px 10px;"><p>سلة المحذوفات فارغة.</p><p class="muted">أي بيعة تحذفها ستظهر هنا ويمكن استعادتها.</p></div>`;
+  body.innerHTML=items.length?`<div class="trash-note">المحذوفات تبقى هنا بدون مدة انتهاء حتى تحذفها نهائيًا أو تستعيدها. الاستعادة تعيد العميل ودفعاته وملاحظاته، وتتم مزامنتها مع السحابة عند الاتصال بالإنترنت.</div>${items.map(x=>`<div class="trash-row"><div class="trash-row-body"><div class="trash-row-name">${esc(x.sale?.customerName||"عميل بدون اسم")}</div><div class="trash-row-meta">حُذف: ${fmtDate(x.deletedAt)} · ${fmtMoney(x.sale?.totalAmount||0)} ريال</div></div><div class="trash-actions"><button class="btn-small restore" data-restore="${esc(x.saleId)}">استعادة</button><button class="btn-small delete" data-purge="${esc(x.saleId)}">حذف نهائي</button></div></div>`).join("")}`:`<div class="empty-state" style="padding:30px 10px;"><p>سلة المحذوفات فارغة.</p><p class="muted">أي بيعة تحذفها ستظهر هنا ويمكن استعادتها.</p></div>`;
   body.querySelectorAll("[data-restore]").forEach(b=>b.onclick=()=>restoreSaleFromTrash(b.dataset.restore));
   body.querySelectorAll("[data-purge]").forEach(b=>b.onclick=async()=>{if(confirm("حذف نهائي؟ لا يمكن استعادة هذه البيعة بعد ذلك."))await permanentlyDeleteFromTrash(b.dataset.purge);});
 }
